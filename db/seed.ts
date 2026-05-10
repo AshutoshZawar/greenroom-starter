@@ -974,7 +974,12 @@ async function main() {
     // Comps for every show (past or upcoming)
     compsToInsert.push(...generateComps(showId, artist.tier, avgPrice));
 
-    if (isPast) {
+    // Generate full financial data for ALL shows — past and future.
+    // The query layer time-gates future shows so settlement/ticket data
+    // only surfaces once the show date has passed. This way candidates
+    // opening the case on any future date see complete data for shows
+    // that have moved into the past.
+    {
       const sellThrough = generateSellThrough(artist.tier);
       const ticketCount = Math.round(VENUE_CAPACITY * sellThrough);
       const gross = Math.round(ticketCount * avgPrice * (0.9 + rnd() * 0.2));
@@ -995,7 +1000,8 @@ async function main() {
       const passThru = showExpenses.filter((e) => !e.absorbedByVenue).reduce((s, e) => s + e.amount, 0);
       const totalToArtist = computeSettlement(deal, gross, fees, passThru);
 
-      const stage = pickSettlementStage(daysAgo);
+      const effectiveDaysAgo = isPast ? daysAgo : rndInt(3, 30);
+      const stage = isPast ? pickSettlementStage(daysAgo) : pickSettlementStage(effectiveDaysAgo);
       const ts = settlementTimestamps(stage, showDate);
 
       // Recoups for ~30% of settlements

@@ -1,5 +1,11 @@
 /**
  * Server-side query helpers.
+ *
+ * Time-gate: shows whose date is in the future are returned with settlement,
+ * ticket, expense, and recoup data suppressed. The data exists in the DB
+ * (seeded for every show) but only surfaces once the show date has passed.
+ * This means a candidate opening the case on any date sees complete data
+ * for all past shows, regardless of when the seed was originally run.
  */
 
 import { db } from "@/db";
@@ -16,10 +22,20 @@ import {
   venues,
   type Recoup,
 } from "@/db/schema";
-import { desc, asc, eq, sql } from "drizzle-orm";
+import { desc, asc, eq, sql, lt } from "drizzle-orm";
+
+function todayDateString(): string {
+  const d = new Date();
+  d.setHours(0, 0, 0, 0);
+  return d.toISOString().slice(0, 10);
+}
+
+function isShowPast(showDate: string): boolean {
+  return showDate < todayDateString();
+}
 
 export async function getAllShows() {
-  return db
+  const rows = await db
     .select({
       show: shows,
       artist: artists,
@@ -33,6 +49,13 @@ export async function getAllShows() {
     .leftJoin(deals, eq(deals.showId, shows.id))
     .leftJoin(settlements, eq(settlements.showId, shows.id))
     .orderBy(asc(shows.date));
+
+  return rows.map((row) => {
+    if (isShowPast(row.show.date)) {
+      return { ...row, show: { ...row.show, status: "settled" as const } };
+    }
+    return { ...row, settlement: null };
+  });
 }
 
 export async function getShowById(id: string) {
@@ -58,6 +81,8 @@ export async function getShowById(id: string) {
   if (rows.length === 0) return null;
   const row = rows[0];
 
+  const past = isShowPast(row.show.date);
+
   const [showTicketSales, showExpenses, showComps] = await Promise.all([
     db
       .select()
@@ -72,9 +97,8 @@ export async function getShowById(id: string) {
     db.select().from(comps).where(eq(comps.showId, id)),
   ]);
 
-  // Decode recoups JSON
   let recoups: Recoup[] = [];
-  if (row.settlement?.recoupsJson) {
+  if (past && row.settlement?.recoupsJson) {
     try {
       const parsed = JSON.parse(row.settlement.recoupsJson);
       if (Array.isArray(parsed)) recoups = parsed;
@@ -83,8 +107,20 @@ export async function getShowById(id: string) {
     }
   }
 
+  if (!past) {
+    return {
+      ...row,
+      settlement: null,
+      ticketSales: [],
+      expenses: [],
+      comps: showComps,
+      recoups: [],
+    };
+  }
+
   return {
     ...row,
+    show: { ...row.show, status: "settled" as const },
     ticketSales: showTicketSales,
     expenses: showExpenses,
     comps: showComps,
@@ -114,57 +150,71 @@ export async function getAllArtists() {
     .orderBy(desc(sql`count(${shows.id})`), asc(artists.name));
 }
 
-/** Aggregates for the reports page. */
+/** Aggregates for the reports page — only counts past shows. */
 export async function getReports() {
-  const allDealsRows = await db.select().from(deals);
-  const allSettlementsRows = await db.select().from(settlements);
+  const today = todayDateString();
+
   const allShowsRows = await db.select().from(shows);
+  const pastShowIds = new Set(
+    allShowsRows.filter((s) => s.date < today).map((s) => s.id),
+  );
+
+  const allDealsRows = await db.select().from(deals);
+  const pastDeals = allDealsRows.filter((d) => pastShowIds.has(d.showId));
+
+  const allSettlementsRows = await db.select().from(settlements);
+  const pastSettlements = allSettlementsRows.filter((s) =>
+    pastShowIds.has(s.showId),
+  );
+
   const allCompsRows = await db.select().from(comps);
+  const pastComps = allCompsRows.filter((c) => pastShowIds.has(c.showId));
 
   const dealTypeCounts: Record<string, number> = {};
-  for (const d of allDealsRows) {
+  for (const d of pastDeals) {
     dealTypeCounts[d.dealType] = (dealTypeCounts[d.dealType] ?? 0) + 1;
   }
 
-  const totalDeals = allDealsRows.length;
+  const totalDeals = pastDeals.length;
   const supportedTypes = ["flat", "percentage_of_gross"];
-  const supportedCount = allDealsRows.filter((d) =>
+  const supportedCount = pastDeals.filter((d) =>
     supportedTypes.includes(d.dealType),
   ).length;
   const inAppToolUsageRate = totalDeals > 0 ? supportedCount / totalDeals : 0;
 
   const settlementStatus: Record<string, number> = {};
-  for (const s of allSettlementsRows) {
+  for (const s of pastSettlements) {
     settlementStatus[s.status] = (settlementStatus[s.status] ?? 0) + 1;
   }
 
-  const totalSettlements = allSettlementsRows.length;
+  const totalSettlements = pastSettlements.length;
   const disputedRate =
     totalSettlements > 0
       ? (settlementStatus.disputed ?? 0) / totalSettlements
       : 0;
 
-  const totalGross = allSettlementsRows.reduce(
+  const totalGross = pastSettlements.reduce(
     (sum, s) => sum + (s.grossBoxOffice ?? 0),
     0,
   );
-  const totalToArtists = allSettlementsRows.reduce(
+  const totalToArtists = pastSettlements.reduce(
     (sum, s) => sum + (s.totalToArtist ?? 0),
     0,
   );
 
-  const showCount = allShowsRows.length;
-  const settledCount = allShowsRows.filter((s) => s.status === "settled")
-    .length;
+  const showCount = pastShowIds.size;
+  const settledCount = allShowsRows.filter(
+    (s) => pastShowIds.has(s.id),
+  ).length;
 
   // Bonuses
-  const dealsWithBonuses = allDealsRows.filter((d) => d.bonusesJson).length;
+  const dealsWithBonuses = pastDeals.filter((d) => d.bonusesJson).length;
 
   // Recoups
   let totalRecoupValue = 0;
   let disputedRecoupValue = 0;
   let settlementsWithRecoups = 0;
-  for (const s of allSettlementsRows) {
+  for (const s of pastSettlements) {
     if (!s.recoupsJson) continue;
     try {
       const recoups = JSON.parse(s.recoupsJson) as Recoup[];
@@ -180,13 +230,13 @@ export async function getReports() {
   }
 
   // Comps
-  const totalCompTickets = allCompsRows.reduce((s, c) => s + c.count, 0);
-  const totalCompFaceValue = allCompsRows.reduce(
+  const totalCompTickets = pastComps.reduce((s, c) => s + c.count, 0);
+  const totalCompFaceValue = pastComps.reduce(
     (s, c) => s + c.count * c.faceValue,
     0,
   );
   const compsByCategory: Record<string, number> = {};
-  for (const c of allCompsRows) {
+  for (const c of pastComps) {
     compsByCategory[c.category] = (compsByCategory[c.category] ?? 0) + c.count;
   }
 
